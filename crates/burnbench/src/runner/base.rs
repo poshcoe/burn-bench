@@ -57,9 +57,16 @@ struct RunArgs {
     #[clap(short = 'v', long = "verbose")]
     verbose: bool,
 
-    /// Space separated list of backends to include
-    #[clap(short = 'B', long = "backends", num_args(1..), required = true)]
-    backends: Vec<BackendValues>,
+    /// Space separated list of devices (backends) to run on. Selecting more
+    /// devices does not add builds; they all run on the same binary.
+    #[clap(short = 'D', long = "devices", num_args(1..), required = true)]
+    devices: Vec<DeviceValues>,
+
+    /// Space separated list of build profiles (compile-time framework
+    /// decorators), e.g. `default no-fusion`. Each profile is a separate build.
+    /// Defaults to `default`.
+    #[clap(long = "builds", num_args(0..))]
+    builds: Vec<BuildValues>,
 
     /// Space separated list of benches to run
     #[clap(short = 'b', long = "benches", num_args(0..))]
@@ -95,58 +102,85 @@ enum BenchDType {
     BF16,
 }
 
+/// A backend selected at runtime by injecting the corresponding device. Picking
+/// several devices never adds builds: they all run on the same binary.
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum, Display, EnumIter)]
-enum BackendValues {
+enum DeviceValues {
     #[strum(to_string = "all")]
     All,
-    #[strum(to_string = "candle-cpu")]
-    CandleCpu,
-    #[strum(to_string = "candle-cuda")]
-    CandleCuda,
-    #[strum(to_string = "candle-metal")]
-    CandleMetal,
+    #[cfg(not(target_os = "macos"))]
     #[strum(to_string = "cuda")]
     Cuda,
-    #[strum(to_string = "cuda-fusion")]
-    CudaFusion,
-    #[strum(to_string = "cpu")]
-    Cpu,
-    #[strum(to_string = "cpu-fusion")]
-    CpuFusion,
     #[cfg(target_os = "linux")]
     #[strum(to_string = "rocm")]
     Rocm,
-    #[cfg(target_os = "linux")]
-    #[strum(to_string = "rocm-fusion")]
-    RocmFusion,
+    #[cfg(not(target_os = "macos"))]
+    #[strum(to_string = "vulkan")]
+    Vulkan,
+    #[cfg(target_os = "macos")]
+    #[strum(to_string = "metal")]
+    Metal,
+    #[strum(to_string = "wgpu")]
+    Wgpu,
+    #[strum(to_string = "webgpu")]
+    Webgpu,
+    #[strum(to_string = "cpu")]
+    Cpu,
+    #[strum(to_string = "flex")]
+    Flex,
     #[strum(to_string = "ndarray")]
     Ndarray,
-    #[strum(to_string = "ndarray-simd")]
-    NdarraySimd,
-    #[strum(to_string = "ndarray-blas-accelerate")]
-    NdarrayBlasAccelerate,
-    #[strum(to_string = "ndarray-blas-netlib")]
-    NdarrayBlasNetlib,
-    #[strum(to_string = "ndarray-blas-openblas")]
-    NdarrayBlasOpenblas,
     #[strum(to_string = "tch-cpu")]
     TchCpu,
     #[strum(to_string = "tch-cuda")]
     TchCuda,
     #[strum(to_string = "tch-metal")]
     TchMetal,
-    #[strum(to_string = "wgpu")]
-    Wgpu,
-    #[strum(to_string = "wgpu-fusion")]
-    WgpuFusion,
-    #[strum(to_string = "vulkan")]
-    Vulkan,
-    #[strum(to_string = "vulkan-fusion")]
-    VulkanFusion,
-    #[strum(to_string = "metal")]
-    Metal,
-    #[strum(to_string = "metal-fusion")]
-    MetalFusion,
+}
+
+impl DeviceValues {
+    /// Whether this device uses the LibTorch backend, which needs the `tch`
+    /// cargo feature (and an external libtorch) to be compiled in.
+    fn is_tch(&self) -> bool {
+        matches!(
+            self,
+            DeviceValues::TchCpu | DeviceValues::TchCuda | DeviceValues::TchMetal
+        )
+    }
+}
+
+/// A compile-time build profile: which framework decorators (`fusion`,
+/// `autotune`) are enabled. Each profile is a distinct build, so this is what
+/// multiplies the number of builds (together with the selected benches).
+///
+/// `std` is always enabled because the always-linked GPU backends require it.
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum, Display, EnumIter)]
+enum BuildValues {
+    /// Everything on: `fusion` + `autotune` (the default features).
+    #[strum(to_string = "default")]
+    Default,
+    /// Disable kernel fusion.
+    #[strum(to_string = "no-fusion")]
+    NoFusion,
+    /// Disable kernel autotuning.
+    #[strum(to_string = "no-autotune")]
+    NoAutotune,
+    /// Disable every framework decorator (raw backend only).
+    #[strum(to_string = "no-anything")]
+    NoAnything,
+}
+
+impl BuildValues {
+    /// Maps a profile to its cargo feature configuration: whether to pass
+    /// `--no-default-features`, and which framework features to (re-)enable.
+    fn features(&self) -> (bool, &'static [&'static str]) {
+        match self {
+            BuildValues::Default => (false, &[]),
+            BuildValues::NoFusion => (true, &["autotune"]),
+            BuildValues::NoAutotune => (true, &["fusion"]),
+            BuildValues::NoAnything => (true, &[]),
+        }
+    }
 }
 
 /// Execute burnbench on the provided crate located at the provided path.
@@ -181,9 +215,13 @@ fn command_auth() {
 }
 
 fn command_list() {
-    println!("Available Backends:");
-    for backend in BackendValues::iter() {
-        println!("- {}", backend);
+    println!("Available devices:");
+    for device in DeviceValues::iter() {
+        println!("- {}", device);
+    }
+    println!("\nAvailable build profiles:");
+    for build in BuildValues::iter() {
+        println!("- {}", build);
     }
 }
 
@@ -192,16 +230,34 @@ fn command_run(info: &CrateInfo, mut run_args: RunArgs) {
     if run_args.share {
         tokens = get_tokens();
     }
-    // collect benchmarks and benches to execute
-    let mut backends = run_args.backends.clone();
-    if backends.contains(&BackendValues::All) {
-        backends = BackendValues::iter()
-            .filter(|b| b != &BackendValues::All)
+    // Expand `all` to every device except the LibTorch ones: `tch` requires an
+    // external libtorch, so it is only pulled in when explicitly requested. Any
+    // device the user listed explicitly alongside `all` (e.g. `all tch-cpu`) is
+    // preserved.
+    let mut devices = run_args.devices.clone();
+    if devices.contains(&DeviceValues::All) {
+        let explicit: Vec<DeviceValues> = devices
+            .iter()
+            .filter(|&d| *d != DeviceValues::All)
+            .cloned()
             .collect();
+        let mut expanded: Vec<DeviceValues> = DeviceValues::iter()
+            .filter(|d| *d != DeviceValues::All && !d.is_tch())
+            .collect();
+        for device in explicit {
+            if !expanded.contains(&device) {
+                expanded.push(device);
+            }
+        }
+        devices = expanded;
     }
+    let tch_requested = devices.iter().any(DeviceValues::is_tch);
     let access_token = tokens.map(|t| t.access_token);
 
     // Set the defaults
+    if run_args.builds.is_empty() {
+        run_args.builds.push(BuildValues::Default);
+    }
     if run_args.dtypes.is_empty() {
         run_args.dtypes.push(BenchDType::F32);
     }
@@ -223,7 +279,9 @@ fn command_run(info: &CrateInfo, mut run_args: RunArgs) {
     run_backend_comparison_benchmarks(
         info,
         &run_args.benches,
-        &backends,
+        &devices,
+        &run_args.builds,
+        tch_requested,
         &run_args.versions,
         &run_args.dtypes,
         access_token.as_deref(),
@@ -236,7 +294,9 @@ fn command_run(info: &CrateInfo, mut run_args: RunArgs) {
 fn run_backend_comparison_benchmarks(
     info: &CrateInfo,
     benches: &[String],
-    backends: &[BackendValues],
+    devices: &[DeviceValues],
+    builds: &[BuildValues],
+    tch_requested: bool,
     versions: &[String],
     dtypes: &[BenchDType],
     token: Option<&str>,
@@ -245,7 +305,7 @@ fn run_backend_comparison_benchmarks(
 ) {
     let mut report_collection = BenchmarkCollection::default();
     let inputs_file = std::env::var("WEBHOOK_INPUTS_FILE");
-    let total_count: u64 = (backends.len() * versions.len() * dtypes.len())
+    let total_count: u64 = (versions.len() * builds.len() * devices.len() * dtypes.len())
         .try_into()
         .unwrap();
     let runner_pb: Option<Arc<Mutex<RunnerProgressBar>>> = if verbose {
@@ -253,46 +313,61 @@ fn run_backend_comparison_benchmarks(
     } else {
         Some(Arc::new(Mutex::new(RunnerProgressBar::new(total_count))))
     };
-    // Iterate through every combination of benchmark and backend
+    // The build profile (and the set of benches) is what multiplies the number
+    // of compilations: for a fixed profile every device/dtype run reuses the
+    // same cached binary, since the device and dtype are injected at runtime.
     println!("\nBenchmarking Burn @ {versions:?}");
     for version in versions.iter() {
-        for backend in backends.iter() {
-            for dtype in dtypes.iter() {
-                let bench_str = benches.join(", ");
-                let backend_str = backend.to_string();
-                let url = format!("{TRACEL_CI_SERVER_BASE_URL}benchmarks");
+        for build in builds.iter() {
+            for device in devices.iter() {
+                for dtype in dtypes.iter() {
+                    let bench_str = benches.join(", ");
+                    let device_str = device.to_string();
+                    let build_str = build.to_string();
+                    let label = format!("{device_str} ({build_str})");
+                    let url = format!("{TRACEL_CI_SERVER_BASE_URL}benchmarks");
 
-                if verbose {
-                    group!("Running benchmarks: {bench_str}@{backend_str}-{dtype}");
-                }
-                let status = run_cargo(
-                    info,
-                    benches,
-                    &backend_str,
-                    dtype,
-                    &url,
-                    token,
-                    &runner_pb,
-                    version,
-                    profiling,
-                );
-                let success = status.unwrap().success();
+                    if verbose {
+                        group!("Running benchmarks: {bench_str}@{label}-{dtype}");
+                    }
+                    let status = run_cargo(
+                        info,
+                        benches,
+                        &device_str,
+                        build,
+                        tch_requested,
+                        dtype,
+                        &url,
+                        token,
+                        &runner_pb,
+                        version,
+                        profiling,
+                    );
+                    let success = status.unwrap().success();
 
-                if success {
-                    if let Some(ref pb) = runner_pb {
-                        pb.lock().unwrap().succeeded_inc();
+                    if success {
+                        if let Some(ref pb) = runner_pb {
+                            pb.lock().unwrap().succeeded_inc();
+                        }
+                    } else {
+                        if let Some(ref pb) = runner_pb {
+                            pb.lock().unwrap().failed_inc();
+                        }
+                        // A failed `cargo bench` invocation fails every bench it
+                        // covers; list each failed combination as its own row.
+                        for bench in benches.iter() {
+                            report_collection.push_failed_benchmark(FailedBenchmark {
+                                bench: bench.clone(),
+                                version: version.clone(),
+                                build: build_str.clone(),
+                                device: device_str.clone(),
+                                dtype: dtype.to_string(),
+                            });
+                        }
                     }
-                } else {
-                    if let Some(ref pb) = runner_pb {
-                        pb.lock().unwrap().failed_inc();
+                    if verbose {
+                        endgroup!();
                     }
-                    report_collection.push_failed_benchmark(FailedBenchmark {
-                        bench: bench_str.clone(),
-                        backend: backend_str.clone(),
-                    })
-                }
-                if verbose {
-                    endgroup!();
                 }
             }
         }
@@ -349,7 +424,9 @@ fn get_required_features(info: &CrateInfo, target_bench: &str) -> Vec<String> {
 fn run_cargo(
     info: &CrateInfo,
     benches: &[String],
-    backend: &str,
+    device: &str,
+    build: &BuildValues,
+    tch_requested: bool,
     dtype: &BenchDType,
     url: &str,
     token: Option<&str>,
@@ -358,10 +435,11 @@ fn run_cargo(
     profile: &Profiling,
 ) -> io::Result<ExitStatus> {
     let bench_str = benches.join(", ");
+    let build_str = build.to_string();
     let processor: Arc<dyn OutputProcessor> = if let Some(pb) = progress_bar {
         Arc::new(NiceProcessor::new(
             bench_str,
-            backend.to_string(),
+            format!("{device} ({build_str})"),
             version.to_string(),
             pb.clone(),
         ))
@@ -370,52 +448,59 @@ fn run_cargo(
     };
     let dependency_version = get_version(version);
     let dependency = Dependency::new(&dependency_version);
-    let mut features = String::new();
 
     let guard = dependency.patch(info.path.as_path()).unwrap();
     let name = &info.name;
-    features += &format!("{name}/{backend},{name}/{dtype}");
 
+    // Backends are selected at runtime by injecting the right device (the
+    // `--device` argument below), so cargo features only control the compile-
+    // time build profile (framework decorators), `tch` (when a LibTorch device
+    // is requested), and any benchmark-specific required features.
+    let (no_default_features, kept_features) = build.features();
+    let mut feature_list: Vec<String> = kept_features
+        .iter()
+        .map(|f| format!("{name}/{f}"))
+        .collect();
+    if tch_requested {
+        feature_list.push(format!("{name}/tch"));
+    }
     for bench in benches.iter() {
         for req_feature in get_required_features(info, bench) {
-            features += &format!(",{}", req_feature);
+            feature_list.push(format!("{name}/{req_feature}"));
         }
     }
+    let features = feature_list.join(",");
+    let dtype_str = dtype.to_string();
 
-    if version.starts_with("0.16") {
-        features += ",legacy-v16";
-    } else if version.starts_with("0.17") {
-        features += ",legacy-v17";
-    }
-
-    for bench in benches.iter() {
-        for req_feature in get_required_features(info, bench) {
-            features += &format!(",{name}/{req_feature}");
-        }
-    }
-
-    let mut args = vec![];
+    let mut args: Vec<&str> = Vec::new();
     if benches[0] == "all" {
-        args = vec![
-            "--benches",
-            "--features",
-            &features,
-            "--target-dir",
-            crate::BENCHMARKS_TARGET_DIR,
-        ]
+        args.push("--benches");
     } else {
         for bench in benches.iter() {
             args.push("--bench");
             args.push(bench);
         }
+    }
+    if no_default_features {
+        args.push("--no-default-features");
+    }
+    if !features.is_empty() {
         args.push("--features");
         args.push(&features);
-        args.push("--target-dir");
-        args.push(crate::BENCHMARKS_TARGET_DIR);
     }
+    args.push("--target-dir");
+    args.push(crate::BENCHMARKS_TARGET_DIR);
 
+    // Runtime arguments forwarded to the benchmark binary: which device to
+    // inject, which dtype to configure, the build label, and optional sharing.
+    args.push("--");
+    args.push("--device");
+    args.push(device);
+    args.push("--dtype");
+    args.push(&dtype_str);
+    args.push("--build");
+    args.push(&build_str);
     if let Some(t) = token {
-        args.push("--");
         args.push("--sharing-url");
         args.push(url);
         args.push("--sharing-token");

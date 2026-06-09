@@ -162,50 +162,6 @@ impl Dependency {
         Ok(guard)
     }
 
-    fn update_feature_flags(version: &Version, content: String) -> String {
-        if version < &Version::new(0, 17, 0) {
-            let content = content
-                .replace("cuda = [\"burn/cuda\"]", "cuda = [\"burn/cuda-jit\"]")
-                .replace("rocm = [\"burn/rocm\"]", "rocm = [\"burn/hip-jit\"]")
-                .replace(
-                    "ndarray-simd = [\"ndarray\", \"burn/simd\"]",
-                    "ndarray-simd = [\"ndarray\"]",
-                )
-                .replace(
-                    "vulkan = [\"burn/vulkan\", \"burn/autotune\"]",
-                    "vulkan = [\"burn/wgpu-spirv\", \"burn/autotune\"]",
-                )
-                .replace(
-                    "metal = [\"burn/vulkan\", \"burn/autotune\"]",
-                    "metal = [\"burn/wgpu\", \"burn/autotune\"]",
-                )
-                .replace(
-                    "ndarray-simd = [\"burn/ndarray\", \"burn/simd\"]",
-                    "ndarray-simd = [\"burn/ndarray\"]",
-                )
-                .replace(
-                    "candle-metal = [\"burn/candle\", \"burn/candle-metal\"]",
-                    "candle-metal = [\"burn/candle\", \"burn/metal\"]",
-                )
-                // Use matching `rand` version (binary and data benchmarks)
-                .replace(
-                    "rand = { version = \"0.9.0\" }",
-                    "rand = { version = \"0.8.5\" }",
-                );
-
-            if (version < &Version::new(0, 16, 1)) & !content.contains("bincode = \"=2.0.0-rc.3\"")
-            {
-                content.replace(
-                    "[dependencies]",
-                    "[dependencies]\nbincode = \"=2.0.0-rc.3\"\nbincode_derive = \"=2.0.0-rc.3\"",
-                )
-            } else {
-                content
-            }
-        } else {
-            content
-        }
-    }
     fn update_burn_version(
         &self,
         content: &DependencyContent,
@@ -215,46 +171,11 @@ impl Dependency {
         log::info!("Applying Burn version: {version_str}");
 
         // Update burn versions
-
-        let update_version = |content: &str| {
-            let mut content = content.to_string();
-            for base in BURN_BASE {
-                let regex = base.to_string() + REGEX_BASE;
-                let burn_re = Regex::new(&regex).unwrap();
-                content = burn_re
-                    .replace_all(
-                        content.as_str(),
-                        format!(
-                            "{base} = {{ version = \"={}\", default-features = false }}",
-                            version_str
-                        ),
-                    )
-                    .to_string();
-            }
-
-            content
+        let update = |content: &str| {
+            rewrite_burn_deps(content, |_base| format!("version = \"={version_str}\""))
         };
 
-        match &content.workspace {
-            Some(original) => {
-                let workspace = update_version(original);
-                let benches = Self::update_feature_flags(version, content.benches.clone());
-
-                Ok(DependencyContentUpdate {
-                    benches: Some(benches),
-                    workspace: Some(workspace),
-                })
-            }
-            None => {
-                let benches = update_version(&content.benches);
-                let benches = Self::update_feature_flags(version, benches);
-
-                Ok(DependencyContentUpdate {
-                    benches: Some(benches),
-                    workspace: None,
-                })
-            }
-        }
+        Ok(content.update(update))
     }
 
     // NOTE: [patch] can only be applied at the root of the workspace
@@ -269,17 +190,9 @@ impl Dependency {
 
         // Update burn git reference
         let update = |content: &str| {
-            let mut content = content.to_string();
-            for base in BURN_BASE {
-                let regex = base.to_string() + REGEX_BASE;
-                let burn_re = Regex::new(&regex).unwrap();
-                content = burn_re.replace_all(
-                    content.as_str(),
-                    format!("{base} = {{ git = \"https://github.com/tracel-ai/burn\", {}, default-features = false }}", reference)
-                ).to_string();
-            }
-
-            content
+            rewrite_burn_deps(content, |_base| {
+                format!("git = \"https://github.com/tracel-ai/burn\", {reference}")
+            })
         };
 
         Ok(content.update(update))
@@ -298,24 +211,10 @@ impl Dependency {
             None => Path::new("../").join(repo_path),
         };
         let update = |content: &str| {
-            let mut content = content.to_string();
             let repo_path = repo_path.as_path();
-
-            for base in BURN_BASE {
-                let regex = base.to_string() + REGEX_BASE;
-                let burn_re = Regex::new(&regex).unwrap();
-                content = burn_re
-                    .replace_all(
-                        &content,
-                        format!(
-                            "{base} = {{ path = \"{}crates/{base}\", default-features = false }}",
-                            repo_path.to_str().unwrap()
-                        ),
-                    )
-                    .to_string();
-            }
-
-            content
+            rewrite_burn_deps(content, |base| {
+                format!("path = \"{}crates/{base}\"", repo_path.to_str().unwrap())
+            })
         };
 
         Ok(content.update(update))
@@ -326,4 +225,36 @@ fn is_commit_hash(reference: &str) -> bool {
     // Check if the reference is a valid commit hash (7 to 40 hexadecimal characters)
     let re = Regex::new(r"^[0-9a-f]{7,40}$").unwrap();
     re.is_match(reference)
+}
+
+/// Rewrites the source specifier (git/path/version) of every `burn*` dependency
+/// block, preserving any `features = [...]` array already declared on that block.
+///
+/// Backends are now selected through features declared directly on the `burn`
+/// dependency (including OS-conditional target tables), so the patch must keep
+/// them instead of collapsing every block to a feature-less `default-features =
+/// false` declaration.
+fn rewrite_burn_deps(content: &str, source_for: impl Fn(&str) -> String) -> String {
+    let features_re = Regex::new(r"features\s*=\s*\[[^\]]*\]").unwrap();
+    let mut content = content.to_string();
+    for base in BURN_BASE {
+        // Anchor the dependency name to the start of a line so commented-out
+        // template lines (`# burn = { ... }`) are left untouched.
+        let regex = format!("(?m)^{base}{REGEX_BASE}");
+        let burn_re = Regex::new(&regex).unwrap();
+        content = burn_re
+            .replace_all(&content, |caps: &regex::Captures| {
+                let matched = &caps[0];
+                let features = features_re
+                    .find(matched)
+                    .map(|m| format!(", {}", m.as_str()))
+                    .unwrap_or_default();
+                format!(
+                    "{base} = {{ {}, default-features = false{features} }}",
+                    source_for(base)
+                )
+            })
+            .to_string();
+    }
+    content
 }
